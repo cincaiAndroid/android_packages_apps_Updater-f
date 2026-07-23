@@ -13,21 +13,30 @@ import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
 import org.lineageos.updater.controller.UpdaterController;
-import org.lineageos.updater.data.Update;
-import org.lineageos.updater.data.UpdateStatus;
+import org.lineageos.updater.misc.StringGenerator;
 import org.lineageos.updater.misc.Utils;
-import org.lineageos.updater.util.OtaMetadataParser;
+import org.lineageos.updater.model.Update;
+import org.lineageos.updater.model.UpdateStatus;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.text.DateFormat;
+import java.util.Enumeration;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 public class UpdateImporter {
     private static final int REQUEST_PICK = 9061;
     private static final String TAG = "UpdateImporter";
     private static final String MIME_ZIP = "application/zip";
     private static final String FILE_NAME = "localUpdate.zip";
+    private static final String METADATA_PATH = "META-INF/com/android/metadata";
+    private static final String METADATA_TIMESTAMP_KEY = "post-timestamp=";
 
     private final Activity activity;
     private final Callbacks callbacks;
@@ -121,19 +130,22 @@ public class UpdateImporter {
         return outFile;
     }
 
-    private Update buildLocalUpdate(File file) throws IOException {
-        final OtaMetadataParser metadata = new OtaMetadataParser(file);
+    private Update buildLocalUpdate(File file) {
+        final long timeStamp = getTimeStamp(file);
+        final String buildDate = StringGenerator.getDateLocalizedUTC(
+                activity, DateFormat.MEDIUM, timeStamp);
         final String name = activity.getString(R.string.local_update_name);
-        return new Update.Builder()
-            .setName(name)
-            .setFile(file)
-            .setFileSize(file.length())
-            .setTimestamp(metadata.getTimestamp())
-            .setOsPatchLevel(metadata.getSecurityPatchLevel())
-            .setOsSdkLevel(metadata.getSdkLevel())
-            .setStatus(UpdateStatus.VERIFIED)
-            .setVersion(name)
-            .build();
+        final Update update = new Update();
+        update.setAvailableOnline(false);
+        update.setName(name);
+        update.setFile(file);
+        update.setFileSize(file.length());
+        update.setDownloadId(Update.LOCAL_ID);
+        update.setTimestamp(timeStamp);
+        update.setStatus(UpdateStatus.VERIFIED);
+        update.setPersistentStatus(UpdateStatus.Persistent.VERIFIED);
+        update.setVersion(String.format("%s (%s)", name, buildDate));
+        return update;
     }
 
     @SuppressWarnings("ResultOfMethodCallIgnored")
@@ -152,7 +164,66 @@ public class UpdateImporter {
 
     private void addUpdate(Update update) {
         UpdaterController controller = UpdaterController.getInstance(activity);
-        controller.addLocalUpdate(update);
+        controller.addUpdate(update, false);
+    }
+
+    private long getTimeStamp(File file) {
+        try {
+            final String metadataContent = readZippedFile(file, METADATA_PATH);
+            final String[] lines = metadataContent.split("\n");
+            for (String line : lines) {
+                if (!line.startsWith(METADATA_TIMESTAMP_KEY)) {
+                    continue;
+                }
+
+                final String timeStampStr = line.replace(METADATA_TIMESTAMP_KEY, "");
+                return Long.parseLong(timeStampStr);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to read date from local update zip package", e);
+        } catch (NumberFormatException e) {
+            Log.e(TAG, "Failed to parse timestamp number from zip metadata file", e);
+        }
+
+        Log.e(TAG, "Couldn't find timestamp in zip file, falling back to $now");
+        return System.currentTimeMillis();
+    }
+
+    private String readZippedFile(File file, String path) throws IOException {
+        final StringBuilder sb = new StringBuilder();
+        InputStream iStream = null;
+
+        try (final ZipFile zip = new ZipFile(file)) {
+            final Enumeration<? extends ZipEntry> iterator = zip.entries();
+            while (iterator.hasMoreElements()) {
+                final ZipEntry entry = iterator.nextElement();
+                if (!METADATA_PATH.equals(entry.getName())) {
+                    continue;
+                }
+
+                iStream = zip.getInputStream(entry);
+                break;
+            }
+
+            if (iStream == null) {
+                throw new FileNotFoundException("Couldn't find " + path + " in " + file.getName());
+            }
+
+            final byte[] buffer = new byte[1024];
+            int read;
+            while ((read = iStream.read(buffer)) > 0) {
+                sb.append(new String(buffer, 0, read, StandardCharsets.UTF_8));
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to read file from zip package", e);
+            throw e;
+        } finally {
+            if (iStream != null) {
+                iStream.close();
+            }
+        }
+
+        return sb.toString();
     }
 
     public interface Callbacks {

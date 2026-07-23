@@ -4,6 +4,7 @@
  */
 package org.lineageos.updater;
 
+import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.ContentResolver;
@@ -11,16 +12,17 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Log;
 import android.widget.Toast;
 
 import androidx.core.app.NotificationCompat;
 
-import org.lineageos.updater.util.FileUtils;
-import org.lineageos.updater.notifications.NotificationHelper;
+import org.lineageos.updater.misc.FileUtils;
 
 import java.io.File;
 import java.io.IOException;
+import java.text.NumberFormat;
 
 public class ExportUpdateService extends Service {
 
@@ -32,6 +34,9 @@ public class ExportUpdateService extends Service {
 
     public static final String EXTRA_SOURCE_FILE = "source_file";
     public static final String EXTRA_DEST_URI = "dest_uri";
+
+    private static final String EXPORT_NOTIFICATION_CHANNEL =
+            "export_notification_channel";
 
     private volatile boolean mIsExporting = false;
 
@@ -70,14 +75,17 @@ public class ExportUpdateService extends Service {
         private final ContentResolver mContentResolver;
         private final File mSource;
         private final Uri mDestination;
+        private final FileUtils.ProgressCallBack mProgressCallBack;
         private final Runnable mRunnableComplete;
         private final Runnable mRunnableFailed;
 
         private ExportRunnable(ContentResolver cr, File source, Uri destination,
+                               FileUtils.ProgressCallBack progressCallBack,
                                Runnable runnableComplete, Runnable runnableFailed) {
             mContentResolver = cr;
             mSource = source;
             mDestination = destination;
+            mProgressCallBack = progressCallBack;
             mRunnableComplete = runnableComplete;
             mRunnableFailed = runnableFailed;
         }
@@ -85,7 +93,7 @@ public class ExportUpdateService extends Service {
         @Override
         public void run() {
             try {
-                FileUtils.copyFile(mContentResolver, mSource, mDestination);
+                FileUtils.copyFile(mContentResolver, mSource, mDestination, mProgressCallBack);
                 mIsExporting = false;
                 if (!mExportThread.isInterrupted()) {
                     Log.d(TAG, "Completed");
@@ -106,14 +114,37 @@ public class ExportUpdateService extends Service {
     private void startExporting(File source, Uri destination) {
         final String fileName = FileUtils.queryName(getContentResolver(), destination);
         NotificationManager notificationManager = getSystemService(NotificationManager.class);
+        NotificationChannel notificationChannel = new NotificationChannel(
+                EXPORT_NOTIFICATION_CHANNEL,
+                getString(R.string.export_channel_title),
+                NotificationManager.IMPORTANCE_LOW);
+        notificationManager.createNotificationChannel(notificationChannel);
+
         NotificationCompat.Builder notificationBuilder = new NotificationCompat.Builder(this,
-                NotificationHelper.CHANNEL_EXPORT);
+                EXPORT_NOTIFICATION_CHANNEL);
         NotificationCompat.BigTextStyle notificationStyle = new NotificationCompat.BigTextStyle();
         notificationBuilder.setContentTitle(getString(R.string.dialog_export_title));
         notificationStyle.setBigContentTitle(getString(R.string.dialog_export_title));
         notificationStyle.bigText(fileName);
         notificationBuilder.setStyle(notificationStyle);
-        notificationBuilder.setSmallIcon(R.drawable.ic_notification);
+        notificationBuilder.setSmallIcon(R.drawable.ic_system_update);
+
+        FileUtils.ProgressCallBack progressCallBack = new FileUtils.ProgressCallBack() {
+            private long mLastUpdate = -1;
+
+            @Override
+            public void update(int progress) {
+                long now = SystemClock.elapsedRealtime();
+                if (mLastUpdate < 0 || now - mLastUpdate > 500) {
+                    String percent = NumberFormat.getPercentInstance().format(progress / 100.f);
+                    notificationStyle.setSummaryText(percent);
+                    notificationBuilder.setProgress(100, progress, false);
+                    notificationManager.notify(NOTIFICATION_ID,
+                            notificationBuilder.build());
+                    mLastUpdate = now;
+                }
+            }
+        };
 
         startForeground(NOTIFICATION_ID, notificationBuilder.build(),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
@@ -144,7 +175,7 @@ public class ExportUpdateService extends Service {
         };
 
         ExportRunnable exportRunnable = new ExportRunnable(getContentResolver(), source,
-                destination, runnableComplete, runnableFailed);
+                destination, progressCallBack, runnableComplete, runnableFailed);
         mExportThread = new Thread(exportRunnable);
         mExportThread.start();
     }
